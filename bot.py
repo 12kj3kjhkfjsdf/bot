@@ -7,6 +7,7 @@ import random
 import time
 import asyncio
 import re
+from collections import defaultdict, deque
 from datetime import datetime, timezone, timedelta
 
 
@@ -149,6 +150,18 @@ bot = commands.Bot(
     help_command=None,
     case_insensitive=True,
 )
+# ============================================================
+# MODERATION / ANTI-SPAM
+# ============================================================
+
+SPAM_MESSAGE_LIMIT = 10
+SPAM_WINDOW_SECONDS = 10
+SPAM_FIRST_TIMEOUT_SECONDS = 60
+SPAM_SECOND_TIMEOUT_SECONDS = 2 * 60 * 60
+SPAM_ESCALATION_WINDOW_SECONDS = 60 * 60
+
+spam_message_times = defaultdict(deque)
+spam_escalation = {}
 
 
 # ============================================================
@@ -4303,6 +4316,24 @@ async def commands_list(ctx):
     )
 
     embed.add_field(
+        name="🛡️ MODERATION",
+        value=(
+            "### `!ban <@User> [reason]`\n"
+            "Bans a member. Admin-only.\n\n"
+
+            "### `!timeout <@User> <time> [reason]`\n"
+            "Times out a member. Admin-only.\n"
+            "Examples: `10m`, `2h`, `1d`.\n\n"
+
+            "### AUTOMATIC ANTI-SPAM\n"
+            "10 messages in 10 seconds = warning.\n"
+            "Repeat it = 1-minute timeout.\n"
+            "Repeat again within 1 hour = 2-hour timeout."
+        ),
+        inline=False,
+    ),
+
+    embed.add_field(
         name="⚙️ SYSTEM FEATURES",
         value=(
             "✅ Persistent buttons\n"
@@ -4339,6 +4370,304 @@ async def commands_list(ctx):
         embed=embed
     )
 
+
+# ============================================================
+# MODERATION
+# ============================================================
+
+def parse_duration(value):
+    if not value:
+        return None
+
+    match = re.fullmatch(
+        r"(\d+(?:\.\d+)?)([smhdw])",
+        str(value).strip().lower(),
+    )
+
+    if not match:
+        return None
+
+    amount = float(match.group(1))
+    unit = match.group(2)
+
+    multipliers = {
+        "s": 1,
+        "m": 60,
+        "h": 60 * 60,
+        "d": 60 * 60 * 24,
+        "w": 60 * 60 * 24 * 7,
+    }
+
+    return int(amount * multipliers[unit])
+
+
+def moderation_target_is_admin(member):
+    return (
+        member.guild_permissions.administrator
+        or any(
+            role.name.lower() == ADMIN_ROLE_NAME.lower()
+            for role in member.roles
+        )
+    )
+
+
+async def send_moderation_dm(member, title, message):
+    try:
+        embed = discord.Embed(
+            title=title,
+            description=message,
+            color=discord.Color.red(),
+        )
+        await member.send(embed=embed)
+    except (discord.Forbidden, discord.HTTPException):
+        pass
+
+
+@bot.command(
+    name="ban"
+)
+async def ban_command(
+    ctx,
+    member: discord.Member = None,
+    *,
+    reason=None,
+):
+
+    if not await require_admin(ctx):
+        return
+
+    if member is None:
+        await ctx.send(
+            "Usage: `!ban @User [reason]`"
+        )
+        return
+
+    if member == ctx.author:
+        await ctx.send(
+            "❌ You cannot ban yourself."
+        )
+        return
+
+    if member == ctx.guild.owner:
+        await ctx.send(
+            "❌ You cannot ban the server owner."
+        )
+        return
+
+    if moderation_target_is_admin(member):
+        await ctx.send(
+            "❌ You cannot ban another Admin."
+        )
+        return
+
+    if not ctx.guild.me.guild_permissions.ban_members:
+        await ctx.send(
+            "❌ I do not have the **Ban Members** permission."
+        )
+        return
+
+    reason = reason or f"Banned by {ctx.author}"
+
+    await send_moderation_dm(
+        member,
+        "🔨 You have been banned",
+        f"You were banned from **{ctx.guild.name}**.\n\n"
+        f"Reason: **{reason}**",
+    )
+
+    try:
+        await member.ban(
+            reason=reason,
+            delete_message_seconds=0,
+        )
+    except discord.Forbidden:
+        await ctx.send(
+            "❌ I cannot ban that user. Check my role position and permissions."
+        )
+        return
+
+    await ctx.send(
+        f"🔨 **{member}** has been banned.\n"
+        f"Reason: **{reason}**"
+    )
+
+
+@bot.command(
+    name="timeout"
+)
+async def timeout_command(
+    ctx,
+    member: discord.Member = None,
+    duration=None,
+    *,
+    reason=None,
+):
+
+    if not await require_admin(ctx):
+        return
+
+    if member is None or duration is None:
+        await ctx.send(
+            "Usage: `!timeout @User <time> [reason]`\n"
+            "Examples: `!timeout @User 10m`, `!timeout @User 2h`"
+        )
+        return
+
+    seconds = parse_duration(duration)
+
+    if seconds is None or seconds <= 0:
+        await ctx.send(
+            "❌ Invalid time. Use `30s`, `10m`, `2h`, `1d`, or `1w`."
+        )
+        return
+
+    max_timeout = 28 * 24 * 60 * 60
+
+    if seconds > max_timeout:
+        await ctx.send(
+            "❌ Discord allows a maximum timeout of 28 days."
+        )
+        return
+
+    if member == ctx.author:
+        await ctx.send(
+            "❌ You cannot timeout yourself."
+        )
+        return
+
+    if member == ctx.guild.owner:
+        await ctx.send(
+            "❌ You cannot timeout the server owner."
+        )
+        return
+
+    if moderation_target_is_admin(member):
+        await ctx.send(
+            "❌ You cannot timeout another Admin."
+        )
+        return
+
+    if not ctx.guild.me.guild_permissions.moderate_members:
+        await ctx.send(
+            "❌ I do not have the **Moderate Members** permission."
+        )
+        return
+
+    reason = reason or f"Timed out by {ctx.author}"
+
+    until = discord.utils.utcnow() + timedelta(seconds=seconds)
+
+    try:
+        await member.timeout(
+            until,
+            reason=reason,
+        )
+    except discord.Forbidden:
+        await ctx.send(
+            "❌ I cannot timeout that user. Check my role position and permissions."
+        )
+        return
+
+    await send_moderation_dm(
+        member,
+        "⏱️ You have been timed out",
+        f"You were timed out in **{ctx.guild.name}** for **{duration}**.\n\n"
+        f"Reason: **{reason}**",
+    )
+
+    await ctx.send(
+        f"⏱️ **{member}** has been timed out for **{duration}**.\n"
+        f"Reason: **{reason}**"
+    )
+
+
+async def handle_spam(message):
+    if not message.guild:
+        return
+
+    member = message.author
+
+    if moderation_target_is_admin(member):
+        return
+
+    now = time.time()
+    user_key = (message.guild.id, member.id)
+    timestamps = spam_message_times[user_key]
+
+    while timestamps and now - timestamps[0] > SPAM_WINDOW_SECONDS:
+        timestamps.popleft()
+
+    timestamps.append(now)
+
+    if len(timestamps) < SPAM_MESSAGE_LIMIT:
+        return
+
+    timestamps.clear()
+
+    escalation = spam_escalation.get(user_key)
+    previous_action = escalation.get("action") if escalation else 0
+    previous_time = escalation.get("timestamp", 0) if escalation else 0
+
+    if previous_action >= 1 and now - previous_time <= SPAM_ESCALATION_WINDOW_SECONDS:
+        timeout_seconds = SPAM_SECOND_TIMEOUT_SECONDS
+        action_number = 2
+    else:
+        timeout_seconds = SPAM_FIRST_TIMEOUT_SECONDS
+        action_number = 1
+
+    spam_escalation[user_key] = {
+        "action": action_number,
+        "timestamp": now,
+    }
+
+    if not message.guild.me.guild_permissions.moderate_members:
+        await message.channel.send(
+            f"{member.mention} ⚠️ Stop spamming. I do not have permission to timeout members.",
+            delete_after=10,
+        )
+        return
+
+    if action_number == 1:
+        await message.channel.send(
+            f"{member.mention} ⚠️ **Stop spamming.** 10 messages in 10 seconds detected. Do it again and you will be timed out for **1 minute**.",
+            delete_after=10,
+        )
+        dm_title = "⚠️ Spam warning"
+        dm_text = (
+            f"You sent 10 messages within 10 seconds in **{message.guild.name}**.\n\n"
+            "This is your warning. If you repeat the spam, you will be timed out for 1 minute."
+        )
+    else:
+        dm_title = "⏱️ Spam timeout"
+        dm_text = (
+            f"You repeated the spam violation in **{message.guild.name}** within 1 hour of your previous warning.\n\n"
+            "You have been timed out for 2 hours."
+        )
+
+    try:
+        until = discord.utils.utcnow() + timedelta(seconds=timeout_seconds)
+        await member.timeout(
+            until,
+            reason="Automatic anti-spam moderation",
+        )
+
+        await send_moderation_dm(
+            member,
+            dm_title,
+            dm_text,
+        )
+
+        if action_number == 2:
+            await message.channel.send(
+                f"{member.mention} ⏱️ **2-hour timeout** for repeated spam.",
+                delete_after=10,
+            )
+
+    except discord.Forbidden:
+        await message.channel.send(
+            f"{member.mention} ⚠️ Stop spamming. I could not apply the automatic timeout because of my permissions.",
+            delete_after=10,
+        )
 
 # ============================================================
 # UNKNOWN COMMAND / ERROR HANDLER
@@ -4398,6 +4727,10 @@ async def on_message(
 
     if message.author.bot:
         return
+
+    await handle_spam(
+        message
+    )
 
     await bot.process_commands(
         message
