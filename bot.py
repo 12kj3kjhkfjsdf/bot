@@ -14,7 +14,7 @@ from datetime import datetime, timezone, timedelta
 # CONFIGURATION
 # ============================================================
 
-TOKEN = "MTU0Mzk3MTUxMDE5MTAwNTcwOA.G8HRi9.7DwuOxDJMTAPCb0CB_0T5GfBNVMHxha4SIdSZ0"
+TOKEN = os.getenv("DISCORD_TOKEN", "PASTE_YOUR_BOT_TOKEN_HERE")
 
 PREFIX = "!"
 
@@ -1790,200 +1790,238 @@ async def priority_ticket(interaction):
 
 
 # ============================================================
-# REVIEW VIEW
+# ============================================================
+# REVIEW SYSTEM
 # ============================================================
 
-class ReviewView(View):
+LOW_RATING_FEEDBACK_USER_ID = 1492159355620167720
 
-    def __init__(
-        self,
-        order_id,
-        customer_id,
-    ):
-        super().__init__(
-            timeout=86400
-        )
 
-        self.order_id = order_id
-        self.customer_id = customer_id
-        self.already_reviewed = False
+def get_review_order_id(message):
+    if not message or not message.embeds:
+        return None
 
-    async def save_review(
-        self,
-        interaction,
-        rating,
-    ):
+    footer = message.embeds[0].footer.text or ""
+    match = re.search(r"Order #([0-9]+)", footer)
+    return match.group(1) if match else None
 
-        if interaction.user.id != self.customer_id:
 
+def review_already_submitted(order_id, customer_id):
+    return any(
+        str(review.get("order_id")) == str(order_id)
+        and int(review.get("user_id", 0)) == int(customer_id)
+        for review in reviews
+    )
+
+
+async def save_review_record(order_id, customer, rating, feedback=None):
+    if review_already_submitted(order_id, customer.id):
+        return False
+
+    data = orders.get(str(order_id), {})
+
+    review = {
+        "order_id": str(order_id),
+        "user_id": customer.id,
+        "user": str(customer),
+        "rating": int(rating),
+        "admin": data.get("admin", "Unknown"),
+        "feedback": feedback or "",
+        "timestamp": int(time.time()),
+    }
+
+    reviews.append(review)
+    save_json(REVIEWS_FILE, reviews)
+
+    admin_id = data.get("admin_id")
+    if admin_id:
+        key = str(admin_id)
+
+        if key not in admin_stats:
+            admin_stats[key] = {
+                "name": data.get("admin", "Unknown"),
+                "tickets_completed": 0,
+                "payments_handled": 0,
+                "revenue_handled": 0,
+                "reviews": [],
+            }
+
+        admin_stats[key].setdefault("reviews", []).append(int(rating))
+        save_json(ADMIN_STATS_FILE, admin_stats)
+
+    return True
+
+
+class LowRatingFeedbackModal(Modal, title="Low Rating Feedback"):
+
+    feedback = TextInput(
+        label="What went wrong?",
+        placeholder="Tell us what we can improve...",
+        style=discord.TextStyle.paragraph,
+        required=True,
+        max_length=1000,
+    )
+
+    def __init__(self, order_id, rating):
+        super().__init__()
+        self.order_id = str(order_id)
+        self.rating = int(rating)
+
+    async def on_submit(self, interaction):
+        if review_already_submitted(self.order_id, interaction.user.id):
             await interaction.response.send_message(
-                "❌ Only the customer who placed this order can submit the review.",
+                "❌ A review has already been submitted for this order.",
                 ephemeral=True,
             )
-
             return
 
-        if self.already_reviewed:
-
+        feedback = self.feedback.value.strip()
+        if not feedback:
             await interaction.response.send_message(
-                "❌ A review has already been submitted.",
+                "❌ Please enter feedback.",
                 ephemeral=True,
             )
-
             return
 
-        data = orders.get(
+        saved = await save_review_record(
             self.order_id,
-            {},
+            interaction.user,
+            self.rating,
+            feedback,
         )
 
-        review = {
-            "order_id": self.order_id,
-            "user_id": interaction.user.id,
-            "user": str(interaction.user),
-            "rating": rating,
-            "admin": data.get(
-                "admin",
-                "Unknown",
-            ),
-            "timestamp": int(
-                time.time()
-            ),
-        }
-
-        reviews.append(
-            review
-        )
-
-        save_json(
-            REVIEWS_FILE,
-            reviews,
-        )
-
-        admin_id = data.get(
-            "admin_id"
-        )
-
-        if admin_id:
-
-            key = str(
-                admin_id
+        if not saved:
+            await interaction.response.send_message(
+                "❌ A review has already been submitted for this order.",
+                ephemeral=True,
             )
+            return
 
-            if key not in admin_stats:
+        target = interaction.client.get_user(LOW_RATING_FEEDBACK_USER_ID)
+        if target is None:
+            try:
+                target = await interaction.client.fetch_user(
+                    LOW_RATING_FEEDBACK_USER_ID
+                )
+            except discord.HTTPException:
+                target = None
 
-                admin_stats[key] = {
-                    "name": data.get(
-                        "admin",
-                        "Unknown",
-                    ),
-                    "tickets_completed": 0,
-                    "payments_handled": 0,
-                    "revenue_handled": 0,
-                    "reviews": [],
-                }
-
-            admin_stats[key].setdefault(
-                "reviews",
-                [],
-            ).append(rating)
-
-            save_json(
-                ADMIN_STATS_FILE,
-                admin_stats,
-            )
-
-        self.already_reviewed = True
+        if target:
+            try:
+                await target.send(
+                    f"⚠️ **Low Customer Rating**\n"
+                    f"Customer: {interaction.user} ({interaction.user.id})\n"
+                    f"Order: **#{self.order_id}**\n"
+                    f"Rating: **{self.rating}/5**\n"
+                    f"Feedback: {feedback}"
+                )
+            except discord.HTTPException:
+                pass
 
         await interaction.response.send_message(
-            f"⭐ Thank you! You gave "
-            f"Order **#{self.order_id}** "
-            f"**{rating}/5 stars**.",
+            f"⭐ Thank you for your feedback on Order **#{self.order_id}**.",
             ephemeral=True,
         )
 
-        for child in self.children:
-            child.disabled = True
 
-        try:
-            await interaction.message.edit(
-                view=self
+class ReviewView(View):
+
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    async def handle_rating(self, interaction, rating):
+        order_id = get_review_order_id(interaction.message)
+
+        if not order_id:
+            await interaction.response.send_message(
+                "❌ I could not identify this order.",
+                ephemeral=True,
             )
-        except discord.HTTPException:
-            pass
+            return
 
-    @discord.ui.button(
-        label="1 ⭐",
-        style=discord.ButtonStyle.secondary,
-    )
-    async def one(
-        self,
-        interaction,
-        button,
-    ):
-        await self.save_review(
-            interaction,
-            1,
+        if review_already_submitted(order_id, interaction.user.id):
+            await interaction.response.send_message(
+                "❌ A review has already been submitted for this order.",
+                ephemeral=True,
+            )
+            return
+
+        if rating <= 2:
+            await interaction.response.send_modal(
+                LowRatingFeedbackModal(order_id, rating)
+            )
+            return
+
+        saved = await save_review_record(
+            order_id,
+            interaction.user,
+            rating,
         )
 
-    @discord.ui.button(
-        label="2 ⭐",
-        style=discord.ButtonStyle.secondary,
-    )
-    async def two(
-        self,
-        interaction,
-        button,
-    ):
-        await self.save_review(
-            interaction,
-            2,
+        if not saved:
+            await interaction.response.send_message(
+                "❌ A review has already been submitted for this order.",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.send_message(
+            f"⭐ Thank you! You gave Order **#{order_id}** **{rating}/5 stars**.",
+            ephemeral=True,
         )
 
-    @discord.ui.button(
-        label="3 ⭐",
-        style=discord.ButtonStyle.secondary,
-    )
-    async def three(
-        self,
-        interaction,
-        button,
-    ):
-        await self.save_review(
-            interaction,
-            3,
-        )
+    @discord.ui.button(label="1 ⭐", style=discord.ButtonStyle.secondary, custom_id="customer_review_1")
+    async def one(self, interaction, button):
+        await self.handle_rating(interaction, 1)
 
-    @discord.ui.button(
-        label="4 ⭐",
-        style=discord.ButtonStyle.secondary,
-    )
-    async def four(
-        self,
-        interaction,
-        button,
-    ):
-        await self.save_review(
-            interaction,
-            4,
-        )
+    @discord.ui.button(label="2 ⭐", style=discord.ButtonStyle.secondary, custom_id="customer_review_2")
+    async def two(self, interaction, button):
+        await self.handle_rating(interaction, 2)
 
-    @discord.ui.button(
-        label="5 ⭐",
-        style=discord.ButtonStyle.success,
-    )
-    async def five(
-        self,
-        interaction,
-        button,
-    ):
-        await self.save_review(
-            interaction,
-            5,
-        )
+    @discord.ui.button(label="3 ⭐", style=discord.ButtonStyle.secondary, custom_id="customer_review_3")
+    async def three(self, interaction, button):
+        await self.handle_rating(interaction, 3)
+
+    @discord.ui.button(label="4 ⭐", style=discord.ButtonStyle.secondary, custom_id="customer_review_4")
+    async def four(self, interaction, button):
+        await self.handle_rating(interaction, 4)
+
+    @discord.ui.button(label="5 ⭐", style=discord.ButtonStyle.success, custom_id="customer_review_5")
+    async def five(self, interaction, button):
+        await self.handle_rating(interaction, 5)
 
 
 # ============================================================
+# REVIEW REQUEST
+# ============================================================
+
+async def send_review_request(channel, order_id, customer_id):
+    try:
+        customer = channel.guild.get_member(int(customer_id))
+
+        if customer is None:
+            customer = await bot.fetch_user(int(customer_id))
+
+        review_embed = discord.Embed(
+            title="⭐ CUSTOMER REVIEW",
+            description=(
+                "Your ticket has been closed.\n\n"
+                "Please rate your experience from **1–5 stars**."
+            ),
+            color=discord.Color.gold(),
+        )
+        review_embed.set_footer(text=f"Order #{order_id}")
+
+        await customer.send(
+            embed=review_embed,
+            view=ReviewView(),
+        )
+        return True
+
+    except (discord.Forbidden, discord.HTTPException, ValueError):
+        return False
+
+
 # COMPLETE TICKET
 # ============================================================
 
@@ -2140,41 +2178,7 @@ async def complete_ticket(interaction):
     )
 
     # --------------------------------------------------------
-    # REVIEW
-    # --------------------------------------------------------
-
-    customer_id = ticket_owner(
-        channel
-    )
-
-    if customer_id:
-
-        review_embed = discord.Embed(
-            title="⭐ CUSTOMER REVIEW",
-            description=(
-                "Thank you for using our service!\n\n"
-                "Please rate your experience below."
-            ),
-            color=discord.Color.gold(),
-        )
-
-        try:
-
-            await channel.send(
-                content=f"<@{customer_id}>",
-                embed=review_embed,
-                view=ReviewView(
-                    order_id,
-                    customer_id,
-                ),
-            )
-
-        except discord.HTTPException:
-            pass
-
-
-# ============================================================
-# TRANSCRIPT
+    # TRANSCRIPT
 # ============================================================
 
 async def create_transcript(channel):
@@ -2430,6 +2434,15 @@ async def close_ticket(interaction):
     await create_transcript(
         channel
     )
+
+    # Send the review request before deleting the ticket.
+    if user_id and order_id:
+        await send_review_request(
+            channel,
+            order_id,
+            user_id,
+        )
+
 
     await asyncio.sleep(
         3
@@ -4055,12 +4068,11 @@ async def transcript(ctx):
 # ============================================================
 
 @bot.command(
-    name="Commands"
+    name="Commands",
+    aliases=["help"],
 )
 async def commands_list(ctx):
 
-    if not await require_admin(ctx):
-        return
 
     embed = discord.Embed(
         title="📖 COMMAND CENTER",
@@ -4457,10 +4469,7 @@ async def setup_persistent_views():
 
 async def main():
 
-    if (
-        TOKEN
-        == "PASTE_YOUR_BOT_TOKEN_HERE"
-    ):
+    if not TOKEN or TOKEN == "PASTE_YOUR_BOT_TOKEN_HERE":
 
         print(
             "ERROR: You need to put your Discord bot token "
